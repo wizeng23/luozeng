@@ -1,0 +1,6 @@
+experiments
+data
+requirements.txt
+code/*.pyc
+code/preprocessing/*.pyc
+.DS_Store

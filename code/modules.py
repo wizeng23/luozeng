@@ -49,10 +49,10 @@ class RNNEncoder(object):
         self.rnn_cell_bw = rnn_cell.GRUCell(self.hidden_size)
         self.rnn_cell_bw = DropoutWrapper(self.rnn_cell_bw, input_keep_prob=self.keep_prob)
 
-    def build_graph(self, inputs, masks):
+    def build_graph(self, blended_reps, masks):
         """
         Inputs:
-          inputs: Tensor shape (batch_size, seq_len, input_size)
+          blended_reps: Tensor shape (batch_size, seq_len, input_size)
           masks: Tensor shape (batch_size, seq_len).
             Has 1s where there is real input, 0s where there's padding.
             This is used to make sure tf.nn.bidirectional_dynamic_rnn doesn't iterate through masked steps.
@@ -66,7 +66,7 @@ class RNNEncoder(object):
 
             # Note: fw_out and bw_out are the hidden states for every timestep.
             # Each is shape (batch_size, seq_len, hidden_size).
-            (fw_out, bw_out), _ = tf.nn.bidirectional_dynamic_rnn(self.rnn_cell_fw, self.rnn_cell_bw, inputs, input_lens, dtype=tf.float32)
+            (fw_out, bw_out), _ = tf.nn.bidirectional_dynamic_rnn(self.rnn_cell_fw, self.rnn_cell_bw, blended_reps, input_lens, dtype=tf.float32)
 
             # Concatenate the forward and backward hidden states
             out = tf.concat([fw_out, bw_out], 2)
@@ -86,12 +86,12 @@ class SimpleSoftmaxLayer(object):
     def __init__(self):
         pass
 
-    def build_graph(self, inputs, masks):
+    def build_graph(self, blended_reps, masks):
         """
         Applies one linear downprojection layer, then softmax.
 
         Inputs:
-          inputs: Tensor shape (batch_size, seq_len, hidden_size)
+          blended_reps: Tensor shape (batch_size, seq_len, hidden_size)
           masks: Tensor shape (batch_size, seq_len)
             Has 1s where there is real input, 0s where there's padding.
 
@@ -106,7 +106,7 @@ class SimpleSoftmaxLayer(object):
         with vs.variable_scope("SimpleSoftmaxLayer"):
 
             # Linear downprojection layer
-            logits = tf.contrib.layers.fully_connected(inputs, num_outputs=1, activation_fn=None) # shape (batch_size, seq_len, 1)
+            logits = tf.contrib.layers.fully_connected(blended_reps, num_outputs=1, activation_fn=None) # shape (batch_size, seq_len, 1)
             logits = tf.squeeze(logits, axis=[2]) # shape (batch_size, seq_len)
 
             # Take softmax over sequence
@@ -126,7 +126,7 @@ class BasicAttn(object):
 
     We choose to use general terminology of keys and values in this module
     (rather than context and question) to avoid confusion if you reuse this
-    module with other inputs.
+    module with other blended_reps.
     """
 
     def __init__(self, keep_prob, key_vec_size, value_vec_size):
@@ -174,6 +174,77 @@ class BasicAttn(object):
             output = tf.nn.dropout(output, self.keep_prob)
 
             return attn_dist, output
+
+
+class AnswerPointer(object):
+    """
+    Uses the Ptr-Net model to predict both the start and end indices of the answer.
+    """
+
+    def __init__(self, batch_size, hidden_size):
+        self.batch_size = batch_size
+        self.hidden_size = hidden_size
+
+    def build_graph(self, blended_reps, masks):
+        """
+        Applies the boundary model of start and end prediction using a decoder.
+
+        Inputs:
+          blended_reps: Tensor shape (batch_size, seq_len, hidden_size)
+          masks: Tensor shape (batch_size, seq_len)
+            Has 1s where there is real input, 0s where there's padding.
+
+        Outputs:
+          logits_start: raw logits before softmax
+          probdist_start: probability distribution of the start index
+          logits_end: raw logits before softmax
+          probdist_end: probability distribution of the end index
+        """
+        with vs.variable_scope("AnswerPointer"):
+            # shape (batch_size, hidden_size, 1)
+            h = tf.get_variable('h', shape=(self.batch_size, self.hidden_size, 1), \
+                initializer=tf.contrib.layers.xavier_initializer()) 
+
+            #h (batch, hidden_size, 1) attend to blended_reps (batch, seq_len, hidden_size)
+            attn_logits = tf.matmul(blended_reps, h) # (batch, seq_len, 1)
+            attn_logits_mask = tf.expand_dims(masks, 2) # shape (batch_size, seq_len, 1)
+            # shape (batch_size, seq_len, 1)
+            masked_logits, attn_dist = masked_softmax(attn_logits, attn_logits_mask, 1)
+            logits_start = tf.squeeze(masked_logits)
+            print 'logstart shape is '
+            print logits_start.shape
+            probdist_start = tf.squeeze(attn_dist)
+            print 'probdist_start shape is '
+            print probdist_start.shape
+            attn_dist_t = tf.transpose(attn_dist, perm=[0, 2, 1]) # (batch_size, 1, seq_len)
+            print 'attndistt shape is '
+            print attn_dist_t.shape
+
+            # Use attention distribution to take weighted sum of hidden states
+            attn_output = tf.matmul(attn_dist_t, blended_reps) # shape (batch_size, 1, hidden_size)
+            print 'attnoutput shape is '
+            print attn_output.shape
+            h = tf.squeeze(attn_output)
+            print 'h shape is '
+            print h.shape
+            ans_point_rnn = rnn_cell.BasicLSTMCell(self.hidden_size)
+            _, state = tf.nn.static_rnn(ans_point_rnn, [h], dtype=tf.float32)
+            h = tf.expand_dims(state.c, 2)
+            print 'h shape is '
+            print h.shape
+
+            # Round 2
+
+            #(hidden_size) attend to (batch, seq_len, hidden_size)
+            attn_logits = tf.matmul(blended_reps, h) # (batch, seq_len, 1)
+            masked_logits, attn_dist = masked_softmax(attn_logits, attn_logits_mask, 1) # shape (batch_size, seq_len, 1)
+            logits_end = tf.squeeze(masked_logits)
+            print 'logend shape is '
+            print logits_end.shape
+            probdist_end = tf.squeeze(attn_dist)
+            print 'probdist_end shape is '
+            print probdist_end.shape
+            return logits_start, probdist_start, logits_end, probdist_end
 
 
 def masked_softmax(logits, mask, dim):
