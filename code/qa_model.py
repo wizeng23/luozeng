@@ -30,7 +30,7 @@ from tensorflow.python.ops import embedding_ops
 from evaluate import exact_match_score, f1_score
 from data_batcher import get_batch_generator
 from pretty_print import print_example
-from modules import RNNEncoder, SimpleSoftmaxLayer, BasicAttn
+from modules import RNNEncoder, SimpleSoftmaxLayer, BasicAttn, RNNAttn, SelfAttn, RNNEncoder2
 
 logging.basicConfig(level=logging.INFO)
 
@@ -62,6 +62,10 @@ class QAModel(object):
 
         # Define trainable parameters, gradient, gradient norm, and clip by gradient norm
         params = tf.trainable_variables()
+
+        #    for v in params:
+        #        print v.name
+
         gradients = tf.gradients(self.loss, params)
         self.gradient_norm = tf.global_norm(gradients)
         clipped_gradients, _ = tf.clip_by_global_norm(gradients, FLAGS.max_gradient_norm)
@@ -78,6 +82,7 @@ class QAModel(object):
         self.bestmodel_saver = tf.train.Saver(tf.global_variables(), max_to_keep=1)
         self.summaries = tf.summary.merge_all()
 
+        # self.char_embedding_size = 20
 
     def add_placeholders(self):
         """
@@ -96,14 +101,20 @@ class QAModel(object):
         # This is necessary so that we can instruct the model to use dropout when training, but not when testing
         self.keep_prob = tf.placeholder_with_default(1.0, shape=())
 
+        # add placeholders to feed in the character IDs for questions and contexts
+        # self.context_character_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len, self.FLAGS.word_len])
+
 
     def add_embedding_layer(self, emb_matrix):
         """
         Adds word embedding layer to the graph.
+        and add character embedding to the graph
 
         Inputs:
           emb_matrix: shape (400002, embedding_size).
             The GloVe vectors, plus vectors for PAD and UNK.
+
+            char_emb_matrix: shape
         """
         with vs.variable_scope("embeddings"):
 
@@ -114,6 +125,16 @@ class QAModel(object):
             # using the placeholders self.context_ids and self.qn_ids
             self.context_embs = embedding_ops.embedding_lookup(embedding_matrix, self.context_ids) # shape (batch_size, context_len, embedding_size)
             self.qn_embs = embedding_ops.embedding_lookup(embedding_matrix, self.qn_ids) # shape (batch_size, question_len, embedding_size)
+
+
+            # chacrater embeddings
+            # self.char_embedding_matrix = tf.get_variable("character_embedding_matrix",
+            #                                              shape = [?, self.char_embedding_size],
+            #                                              dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
+            # self.context_char_embs = embedding_ops.embedding_lookup(self.char_embedding_matrix,
+            #                                                         self.context_character_ids)
+                # shape (batch_size, context_len, word_len?, embedding_size)
+
 
 
     def build_graph(self):
@@ -134,6 +155,9 @@ class QAModel(object):
         context_hiddens = encoder.build_graph(self.context_embs, self.context_mask) # (batch_size, context_len, hidden_size*2)
         question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask) # (batch_size, question_len, hidden_size*2)
 
+        # context_char_hiddens = CharCNN(self.keep_prob).build_graph(self.context_char_embs)
+        # concat??
+
         # Use context hidden states to attend to question hidden states
         attn_layer = BasicAttn(self.keep_prob, self.FLAGS.hidden_size*2, self.FLAGS.hidden_size*2)
         _, attn_output = attn_layer.build_graph(question_hiddens, self.qn_mask, context_hiddens) # attn_output is shape (batch_size, context_len, hidden_size*2)
@@ -141,10 +165,24 @@ class QAModel(object):
         # Concat attn_output to context_hiddens to get blended_reps
         blended_reps = tf.concat([context_hiddens, attn_output], axis=2) # (batch_size, context_len, hidden_size*4)
 
-        # Apply fully connected layer to each blended representation
+        # Send the blended_reps into a one-directional GRU to get question-aware context hidden states
+        qa_context_hiddens = RNNAttn(self.FLAGS.hidden_size*4, self.keep_prob).build_graph(blended_reps, self.context_mask)
+
+        # use self-attention for the question-aware context hidden states themselves
+        sf_attn_layer = SelfAttn(self.keep_prob, self.FLAGS.hidden_size*4, self.FLAGS.context_len)
+        _, sf_attn_output = sf_attn_layer.build_graph(qa_context_hiddens, self.context_mask)
+        # self_attn_output is shape (batch_size, context_len, hidden_size*4)
+
+        # concatenate self-attention output to the question-aware context hidden states
+        blended_self_attn = tf.concat([qa_context_hiddens, sf_attn_output], axis=2) # (batch_size, context_len, hidden_size*8)
+
+        # and pass these as input to a bidirectional RNN to obtain a new set of hidden states
+        new_hidden_states = RNNEncoder2(self.FLAGS.hidden_size*8, self.keep_prob).build_graph(blended_self_attn, self.context_mask) #(batch_size, context_len, hidden_size*8)
+
+        # Apply fully connected layer to self-attention representation
         # Note, blended_reps_final corresponds to b' in the handout
-        # Note, tf.contrib.layers.fully_connected applies a ReLU non-linarity here by default
-        blended_reps_final = tf.contrib.layers.fully_connected(blended_reps, num_outputs=self.FLAGS.hidden_size) # blended_reps_final is shape (batch_size, context_len, hidden_size)
+        # Note, tf.contrib.layers.fully_connected applies a ReLU non-linearity here by default
+        blended_reps_final = tf.contrib.layers.fully_connected(new_hidden_states, num_outputs=self.FLAGS.hidden_size) # blended_reps_final is shape (batch_size, context_len, hidden_size)
 
         # Use softmax layer to compute probability distribution for start location
         # Note this produces self.logits_start and self.probdist_start, both of which have shape (batch_size, context_len)
