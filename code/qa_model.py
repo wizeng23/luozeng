@@ -144,22 +144,11 @@ class QAModel(object):
         # Apply fully connected layer to each blended representation
         # Note, blended_reps_final corresponds to b' in the handout
         # Note, tf.contrib.layers.fully_connected applies a ReLU non-linarity here by default
-        blended_reps_final = tf.contrib.layers.fully_connected(blended_reps, num_outputs=self.FLAGS.hidden_size) # blended_reps_final is shape (batch_size, context_len, hidden_size)
+        blended_reps_final = tf.contrib.layers.fully_connected(blended_reps, num_outputs=self.FLAGS.hidden_size*4) # blended_reps_final is shape (batch_size, context_len, hidden_size*4)
 
-        ans_point = AnswerPointer(self.FLAGS.batch_size, self.FLAGS.hidden_size)
+        ans_point = AnswerPointer(self.FLAGS.hidden_size*4, self.FLAGS.hidden_size*2, self.FLAGS.question_len, self.FLAGS.context_len)
         self.logits_start, self.probdist_start, self.logits_end, self.probdist_end = \
-            ans_point.build_graph(blended_reps_final, self.context_mask)
-        # # Use softmax layer to compute probability distribution for start location
-        # # Note this produces self.logits_start and self.probdist_start, both of which have shape (batch_size, context_len)
-        # with vs.variable_scope("StartDist"):
-        #     softmax_layer_start = SimpleSoftmaxLayer()
-        #     self.logits_start, self.probdist_start = softmax_layer_start.build_graph(blended_reps_final, self.context_mask)
-
-        # # Use softmax layer to compute probability distribution for end location
-        # # Note this produces self.logits_end and self.probdist_end, both of which have shape (batch_size, context_len)
-        # with vs.variable_scope("EndDist"):
-        #     softmax_layer_end = SimpleSoftmaxLayer()
-        #     self.logits_end, self.probdist_end = softmax_layer_end.build_graph(blended_reps_final, self.context_mask)
+            ans_point.build_graph(question_hiddens, blended_reps_final, self.qn_mask, self.context_mask)
 
 
     def add_loss(self):

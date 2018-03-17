@@ -181,18 +181,21 @@ class AnswerPointer(object):
     Uses the Ptr-Net model to predict both the start and end indices of the answer.
     """
 
-    def __init__(self, batch_size, hidden_size):
-        self.batch_size = batch_size
-        self.hidden_size = hidden_size
+    def __init__(self, hidden_size, attn_hidden_size, question_len, context_len):
+        self.hidden_size = hidden_size # 4*h, 8*h after self-attention
+        self.attn_hidden_size = attn_hidden_size # 2*h
+        self.question_len = question_len
+        self.context_len = context_len
 
-    def build_graph(self, blended_reps, masks):
+    def build_graph(self, question_hiddens, context_hiddens, question_mask, context_mask):
         """
-        Applies the boundary model of start and end prediction using a decoder.
+        The output layer of r-net, an answer pointer network
 
         Inputs:
-          blended_reps: Tensor shape (batch_size, seq_len, hidden_size)
-          masks: Tensor shape (batch_size, seq_len)
-            Has 1s where there is real input, 0s where there's padding.
+          question_hiddens: shape (batch_size, question_len, attn_hidden_size)
+          context_hiddens: shape (batch_size, context_len, hidden_size)
+          question_mask: shape (batch_size, question_len)
+          context_mask: shape (batch_size, context_len)
 
         Outputs:
           logits_start: raw logits before softmax
@@ -201,49 +204,63 @@ class AnswerPointer(object):
           probdist_end: probability distribution of the end index
         """
         with vs.variable_scope("AnswerPointer"):
-            # shape (batch_size, hidden_size, 1)
-            h = tf.get_variable('h', shape=(self.batch_size, self.hidden_size, 1), \
-                initializer=tf.contrib.layers.xavier_initializer()) 
+            question_len = self.question_len
+            context_len = self.context_len
+            attn_hidden_size = self.attn_hidden_size
+            hidden_size = self.hidden_size
+            W_uQ = tf.get_variable("W_uQ", shape=(attn_hidden_size, attn_hidden_size),
+                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
+            W_vQ = tf.get_variable("W_vQ", shape=(attn_hidden_size, attn_hidden_size),
+                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
 
-            #h (batch, hidden_size, 1) attend to blended_reps (batch, seq_len, hidden_size)
-            attn_logits = tf.matmul(blended_reps, h) # (batch, seq_len, 1)
-            attn_logits_mask = tf.expand_dims(masks, 2) # shape (batch_size, seq_len, 1)
-            # shape (batch_size, seq_len, 1)
-            masked_logits, attn_dist = masked_softmax(attn_logits, attn_logits_mask, 1)
-            logits_start = tf.squeeze(masked_logits)
-            print 'logstart shape is '
-            print logits_start.shape
-            probdist_start = tf.squeeze(attn_dist)
-            print 'probdist_start shape is '
-            print probdist_start.shape
-            attn_dist_t = tf.transpose(attn_dist, perm=[0, 2, 1]) # (batch_size, 1, seq_len)
-            print 'attndistt shape is '
-            print attn_dist_t.shape
+            V_rQ = tf.get_variable("V_rQ", shape=(attn_hidden_size, 1),
+                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
+            pointnet_v = tf.get_variable("pointnet_v", shape=(attn_hidden_size, 1),
+                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
 
-            # Use attention distribution to take weighted sum of hidden states
-            attn_output = tf.matmul(attn_dist_t, blended_reps) # shape (batch_size, 1, hidden_size)
-            print 'attnoutput shape is '
-            print attn_output.shape
-            h = tf.squeeze(attn_output)
-            print 'h shape is '
-            print h.shape
-            ans_point_rnn = rnn_cell.BasicLSTMCell(self.hidden_size)
-            _, state = tf.nn.static_rnn(ans_point_rnn, [h], dtype=tf.float32)
-            h = tf.expand_dims(state.c, 2)
-            print 'h shape is '
-            print h.shape
+            question_hiddens = tf.reshape(question_hiddens, (-1, attn_hidden_size))
+            WuQ = tf.matmul(question_hiddens, W_uQ)
+            WvQ = tf.matmul(W_vQ, V_rQ)
+            WvQ = tf.reshape(WvQ, (1, attn_hidden_size))
+            pointnet_s = tf.matmul(tf.tanh(WuQ + WvQ), pointnet_v) # shape (batch_size*question_len, 1)
+            pointnet_s = tf.reshape(pointnet_s, (-1, question_len)) # shape (batch_size, question_len)
+            _, pointnet_a = masked_softmax(pointnet_s, question_mask, 1)
+            pointnet_a = tf.expand_dims(pointnet_a, axis=1) # shape (batch_size, 1, question_len)
+            question_hiddens = tf.reshape(question_hiddens, (-1, question_len, attn_hidden_size))
+            pointnet_rQ = tf.matmul(pointnet_a, question_hiddens)
+            pointnet_hidden = tf.squeeze(pointnet_rQ, axis=1) # shape (batch_size, attn_hidden_size)
 
-            # Round 2
+            W_hP = tf.get_variable("W_hP", shape=(hidden_size, attn_hidden_size),
+                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
+            W_ha = tf.get_variable("W_ha", shape=(attn_hidden_size, attn_hidden_size),
+                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
+            output_v = tf.get_variable("output_v", shape=(attn_hidden_size, 1),
+                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
+            context_hiddens = tf.reshape(context_hiddens, (-1, hidden_size))
+            Whp = tf.matmul(context_hiddens, W_hP)
+            # shape (batch_size, context_len, attn_hidden_size)
+            Whp = tf.reshape(Whp, (-1, context_len, attn_hidden_size))
+            Wha = tf.matmul(pointnet_hidden, W_ha) # shape (batch_size, attn_hidden_size)
+            Wha = tf.expand_dims(Wha, 1)
+            tanh = tf.tanh(Whp + Wha) # shape (batch_size, context_len, attn_hidden_size)
+            tanh = tf.reshape(tanh, (-1, attn_hidden_size))
+            s = tf.matmul(tanh, output_v)
+            s = tf.reshape(s, (-1, context_len)) # shape (batch_size, context_len)
+            logits_start, probdist_start = masked_softmax(s, context_mask, 1)
+            a = tf.expand_dims(probdist_start, axis=1) # shape (batch_size, 1, context_len)
+            context_hiddens = tf.reshape(context_hiddens, (-1, context_len, hidden_size))
+            c = tf.matmul(a, context_hiddens) # shape (batch_size, 1, hidden_size)
+            rnn_input = tf.squeeze(c, axis=1) # shape (batch_size, hidden_size)
+            ans_point_rnn = rnn_cell.GRUCell(attn_hidden_size)
+            _, pointnet_hidden = tf.nn.static_rnn(ans_point_rnn, [rnn_input], initial_state=pointnet_hidden, dtype=tf.float32)
 
-            #(hidden_size) attend to (batch, seq_len, hidden_size)
-            attn_logits = tf.matmul(blended_reps, h) # (batch, seq_len, 1)
-            masked_logits, attn_dist = masked_softmax(attn_logits, attn_logits_mask, 1) # shape (batch_size, seq_len, 1)
-            logits_end = tf.squeeze(masked_logits)
-            print 'logend shape is '
-            print logits_end.shape
-            probdist_end = tf.squeeze(attn_dist)
-            print 'probdist_end shape is '
-            print probdist_end.shape
+            Wha2 = tf.matmul(pointnet_hidden, W_ha) # shape (batch_size, attn_hidden_size)
+            Wha2 = tf.expand_dims(Wha2, 1)
+            tanh2 = tf.tanh(Whp + Wha2) # shape (batch_size, context_len, attn_hidden_size)
+            tanh2 = tf.reshape(tanh2, (-1, attn_hidden_size))
+            s2 = tf.matmul(tanh2, output_v)
+            s2 = tf.reshape(s2, (-1, context_len)) # shape (batch_size, context_len)
+            logits_end, probdist_end = masked_softmax(s2, context_mask, 1)
             return logits_start, probdist_start, logits_end, probdist_end
 
 
