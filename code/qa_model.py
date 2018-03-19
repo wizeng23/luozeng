@@ -30,7 +30,11 @@ from tensorflow.python.ops import embedding_ops
 from evaluate import exact_match_score, f1_score
 from data_batcher import get_batch_generator
 from pretty_print import print_example
+<<<<<<< HEAD
 from modules import Params, RNNEncoder, SimpleSoftmaxLayer, Attention
+=======
+from modules import RNNEncoder, SimpleSoftmaxLayer, BasicAttn, AnswerPointer
+>>>>>>> answer-pointer
 
 logging.basicConfig(level=logging.INFO)
 
@@ -127,16 +131,6 @@ class QAModel(object):
             self.qn_embs = embedding_ops.embedding_lookup(embedding_matrix, self.qn_ids) # shape (batch_size, question_len, embedding_size)
 
 
-            # chacrater embeddings
-            # self.char_embedding_matrix = tf.get_variable("character_embedding_matrix",
-            #                                              shape = [?, self.char_embedding_size],
-            #                                              dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
-            # self.context_char_embs = embedding_ops.embedding_lookup(self.char_embedding_matrix,
-            #                                                         self.context_character_ids)
-                # shape (batch_size, context_len, word_len?, embedding_size)
-
-
-
     def build_graph(self):
         """Builds the main part of the graph for the model, starting from the input embeddings to the final distributions for the answer span.
 
@@ -166,17 +160,9 @@ class QAModel(object):
         # self_attn_output is shape (batch_size, context_len, 2*hidden_size)
         self_attn_output = attn_layer.build_graph(gated_output, self.context_mask, gated_output, self.context_mask, self_attn_weights, True)        
 
-        # Use softmax layer to compute probability distribution for start location
-        # Note this produces self.logits_start and self.probdist_start, both of which have shape (batch_size, context_len)
-        with vs.variable_scope("StartDist"):
-            softmax_layer_start = SimpleSoftmaxLayer()
-            self.logits_start, self.probdist_start = softmax_layer_start.build_graph(self_attn_output, self.context_mask)
-
-        # Use softmax layer to compute probability distribution for end location
-        # Note this produces self.logits_end and self.probdist_end, both of which have shape (batch_size, context_len)
-        with vs.variable_scope("EndDist"):
-            softmax_layer_end = SimpleSoftmaxLayer()
-            self.logits_end, self.probdist_end = softmax_layer_end.build_graph(self_attn_output, self.context_mask)
+        ans_point = AnswerPointer(self.FLAGS.hidden_size*4, self.FLAGS.hidden_size*2, self.FLAGS.question_len, self.FLAGS.context_len)
+        self.logits_start, self.probdist_start, self.logits_end, self.probdist_end = \
+            ans_point.build_graph(question_hiddens, blended_reps_final, self.qn_mask, self.context_mask)
 
 
     def add_loss(self):
