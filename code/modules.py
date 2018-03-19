@@ -21,6 +21,36 @@ from tensorflow.python.ops import variable_scope as vs
 from tensorflow.python.ops import rnn_cell
 
 
+def Params(hidden_size):
+    """
+    All of the parameters used in the network
+    """
+    with tf.variable_scope("params"):
+        h = hidden_size
+        return {"W_uQ":tf.get_variable("W_uQ",shape=(2*h, h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer()),
+                "W_uP":tf.get_variable("W_uP", shape=(2*h, h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer()),
+                "W_vP":tf.get_variable("W_vP", shape=(h, h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer()),
+                "W_vP2":tf.get_variable("W_vP2", shape=(2*h, h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer()),
+                "W_g":tf.get_variable("W_g", shape=(4*h, 4*h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer()),
+                "W_g2":tf.get_variable("W_g2", shape=(3*h, 3*h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer()),
+                "W_hP":tf.get_variable("W_hP", shape=(2*h, h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer()),
+                "W_vPhat":tf.get_variable("W_vPhat", shape=(2*h, h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer()),
+                "W_ha":tf.get_variable("W_ha", shape=(2*h, h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer()),
+                "W_vQ":tf.get_variable("W_vQ", shape=(h, h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer()),
+                "v":tf.get_variable("v", shape=(h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer())}
+
+
 class RNNEncoder(object):
     """
     General-purpose module to encode a sequence using a RNN.
@@ -116,76 +146,34 @@ class SimpleSoftmaxLayer(object):
             return masked_logits, prob_dist
 
 
-class BasicAttn(object):
-    """Module for basic attention.
-
-    Note: in this module we use the terminology of "keys" and "values" (see lectures).
-    In the terminology of "X attends to Y", "keys attend to values".
-
-    In the baseline model, the keys are the context hidden states
-    and the values are the question hidden states.
-
-    We choose to use general terminology of keys and values in this module
-    (rather than context and question) to avoid confusion if you reuse this
-    module with other inputs.
+class Attention(object):
+    """
+    Since attention is calculated as a layer twice (gated and self-attention), we created a single
+    layer to represent it, to be initialized with different parameters for each layer.
     """
 
-    def __init__(self, keep_prob, key_vec_size, value_vec_size):
-        """
-        Inputs:
-          keep_prob: tensor containing a single scalar that is the keep probability (for dropout)
-          key_vec_size: size of the key vectors. int
-          value_vec_size: size of the value vectors. int
-        """
+    def __init__(self, keep_prob, hidden_size):
+        self.hidden_size = hidden_size
         self.keep_prob = keep_prob
-        self.key_vec_size = key_vec_size
-        self.value_vec_size = value_vec_size
 
-    def build_graph(self, values, values_mask, keys):
-        """
-        Keys attend to values.
-        For each key, return an attention distribution and an attention output vector.
-
-        Inputs:
-          values: Tensor shape (batch_size, num_values, value_vec_size).
-          values_mask: Tensor shape (batch_size, num_values).
-            1s where there's real input, 0s where there's padding
-          keys: Tensor shape (batch_size, num_keys, value_vec_size)
-
-        Outputs:
-          attn_dist: Tensor shape (batch_size, num_keys, num_values).
-            For each key, the distribution should sum to 1,
-            and should be 0 in the value locations that correspond to padding.
-          output: Tensor shape (batch_size, num_keys, hidden_size).
-            This is the attention output; the weighted sum of the values
-            (using the attention distribution as weights).
-        """
-        with vs.variable_scope("BasicAttn"):
-
-            # Calculate attention distribution
-            values_t = tf.transpose(values, perm=[0, 2, 1]) # (batch_size, value_vec_size, num_values)
-            attn_logits = tf.matmul(keys, values_t) # shape (batch_size, num_keys, num_values)
-            attn_logits_mask = tf.expand_dims(values_mask, 1) # shape (batch_size, 1, num_values)
-            _, attn_dist = masked_softmax(attn_logits, attn_logits_mask, 2) # shape (batch_size, num_keys, num_values). take softmax over values
-
-            # Use attention distribution to take weighted sum of values
-            output = tf.matmul(attn_dist, values) # shape (batch_size, num_keys, value_vec_size)
-
-            # Apply dropout
-            output = tf.nn.dropout(output, self.keep_prob)
-
-            return attn_dist, output
+    def build_graph(self, inputs, inputs_mask, memory, memory_mask, weights, self_matching):
+        with vs.variable_scope("GatedAttn"):
+            cell = Attended_Rnn(self.hidden_size, memory, memory_mask, weights, self_matching)
+            cell = DropoutWrapper(cell, input_keep_prob=self.keep_prob)
+            inputs_masked_len = tf.reduce_sum(inputs_mask, 1)
+            # outputs shape (batch_size, context_len, hidden_size)
+            outputs, _ = tf.nn.dynamic_rnn(cell, inputs, sequence_length=inputs_masked_len, dtype=tf.float32)
+            return outputs
 
 
 class Attended_Rnn(RNNCell):
-  def __init__(self, hidden_size, memory, memory_mask, memory_len, weights, self_matching):
+  def __init__(self, hidden_size, memory, memory_mask, params, self_matching):
     super(RNNCell, self).__init__()
     self.cell = rnn_cell.GRUCell(hidden_size)
     self.hidden_size = hidden_size
     self.memory = memory
     self.memory_mask = memory_mask
-    self.memory_len = memory_len
-    self.weights = weights
+    self.params = params
     self.self_matching = self_matching
 
   @property
@@ -198,27 +186,32 @@ class Attended_Rnn(RNNCell):
 
   def __call__(self, inputs, state, scope = None):
     """Gated recurrent unit (GRU) with nunits cells."""
-    inputs = attend_inputs(inputs, state, self.memory, self.memory_mask, self.memory_len, self.hidden_size, self.weights, self.self_matching)
-    output, new_state = self._cell(inputs, state, scope)
+    inputs = attend_inputs(inputs, state, self.memory, self.memory_mask, self.hidden_size, self.params, self.self_matching)
+    output, new_state = self.cell(inputs, state, scope)
     return output, new_state
 
 
-def attend_inputs(inputs, state, memory, memory_mask, memory_len, hidden_size, weights, self_matching):
+def attend_inputs(inputs, state, memory, memory_mask, hidden_size, params, self_matching):
     """
-    inputs: shape (batch_size, 2*hidden_size)
+    inputs: shape (batch_size, 2*hidden_size) if gated, (batch_size, hidden_size) if self
     state: shape (batch_size, hidden_size)
     memory: shape (batch_size, question_len, 2*hidden_size)
     """
     with tf.variable_scope("attend_inputs"):
-        weights, W_g = weights
+        params, W_g = params
         attn_inputs = [memory, inputs]
         if not self_matching:
             state = tf.reshape(state, (-1, hidden_size))
             attn_inputs.append(state)
-        attention(weights, attn_inputs, memory_len, hidden_size)
+        attn_dist = attention(params, attn_inputs, memory_mask, hidden_size)
+        attn_dist = tf.expand_dims(attn_dist, 2)
+        attn_output = tf.reduce_sum(attn_dist * memory, 1) # shape (batch_size, 2*hidden_size)
+        new_inputs = tf.concat([inputs, attn_output], 1)
+        g = tf.sigmoid(tf.matmul(new_inputs, W_g)) # shape (batch_size, 4*hidden_size)
+        return g * new_inputs
 
 
-def attention(weights, inputs, memory_len, memory_mask, hidden_size):
+def attention(params, inputs, memory_mask, hidden_size):
     """
     TODO: update
     inputs: shape (batch_size, 2*hidden_size)
@@ -230,22 +223,20 @@ def attention(weights, inputs, memory_len, memory_mask, hidden_size):
 
     """
     with tf.variable_scope("attention"):
-        weights, v = weights
+        weights, v = params
         results = []
         for weight, ainput in zip(weights, inputs):
-            shape = ainput.shape
-            ainput = tf.reshape(ainput, (-1, hidden_size))
+            input_shape = ainput.shape.as_list()
+            ainput = tf.reshape(ainput, (-1, input_shape[-1]))
             result = tf.matmul(ainput, weight)
-            if len(shape) > 2:
-                result = tf.reshape(result, (-1, shape[1], hidden_size))
-            else:
+            if len(input_shape) > 2:
+                result = tf.reshape(result, (-1, input_shape[1], hidden_size))
+            elif input_shape[0] is None:
                 result = tf.expand_dims(result, 1)
+            else:
+                result = tf.expand_dims(result, 0)
             results.append(result)
-        results = tf.tanh(sum(results)) # shape (batch_size, memory_len, hidden_size)
-        scores = tf.reduce_sum(tf.tanh(results) * v, [-1])
-        results = tf.reshape(results, -1, hidden_size)
-        s = tf.matmul(results, v)
-        s = tf.reshape(s, (-1, memory_len))
+        s = tf.reduce_sum(tf.tanh(sum(results)) * v, [-1]) # shape (batch_size, memory_len)
         _, attn_dist = masked_softmax(s, memory_mask, 1)
         return attn_dist
 

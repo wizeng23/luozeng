@@ -30,7 +30,7 @@ from tensorflow.python.ops import embedding_ops
 from evaluate import exact_match_score, f1_score
 from data_batcher import get_batch_generator
 from pretty_print import print_example
-from modules import RNNEncoder, SimpleSoftmaxLayer, BasicAttn
+from modules import Params, RNNEncoder, SimpleSoftmaxLayer, Attention
 
 logging.basicConfig(level=logging.INFO)
 
@@ -126,25 +126,28 @@ class QAModel(object):
           self.probdist_start, self.probdist_end: Both shape (batch_size, context_len). Each row sums to 1.
             These are the result of taking (masked) softmax of logits_start and logits_end.
         """
-
+        params = Params(self.FLAGS.hidden_size)
         # Use a RNN to get hidden states for the context and the question
         # Note: here the RNNEncoder is shared (i.e. the weights are the same)
         # between the context and the question.
         encoder = RNNEncoder(self.FLAGS.hidden_size, self.keep_prob)
-        context_hiddens = encoder.build_graph(self.context_embs, self.context_mask) # (batch_size, context_len, hidden_size*2)
-        question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask) # (batch_size, question_len, hidden_size*2)
+        context_hiddens = encoder.build_graph(self.context_embs, self.context_mask) # (batch_size, context_len, 2*hidden_size)
+        question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask) # (batch_size, question_len, 2*hidden_size)
 
         # Use context hidden states to attend to question hidden states
-        attn_layer = BasicAttn(self.keep_prob, self.FLAGS.hidden_size*2, self.FLAGS.hidden_size*2)
-        _, attn_output = attn_layer.build_graph(question_hiddens, self.qn_mask, context_hiddens) # attn_output is shape (batch_size, context_len, hidden_size*2)
+        attn_layer = Attention(self.keep_prob, self.FLAGS.hidden_size)
+        gated_weights = (((params["W_uQ"], params["W_uP"], params["W_vQ"]), params["v"]), params["W_g"])
+        # gated_output is shape (batch_size, context_len, hidden_size)
+        gated_output = attn_layer.build_graph(context_hiddens, self.context_mask, question_hiddens, self.qn_mask, gated_weights, False)
 
         # Concat attn_output to context_hiddens to get blended_reps
-        blended_reps = tf.concat([context_hiddens, attn_output], axis=2) # (batch_size, context_len, hidden_size*4)
+        blended_reps = tf.concat([context_hiddens, gated_output], 2) # (batch_size, context_len, 3*hidden_size)
 
         # Apply fully connected layer to each blended representation
         # Note, blended_reps_final corresponds to b' in the handout
         # Note, tf.contrib.layers.fully_connected applies a ReLU non-linarity here by default
-        blended_reps_final = tf.contrib.layers.fully_connected(blended_reps, num_outputs=self.FLAGS.hidden_size) # blended_reps_final is shape (batch_size, context_len, hidden_size)
+        # blended_reps_final is shape (batch_size, context_len, hidden_size)
+        blended_reps_final = tf.contrib.layers.fully_connected(blended_reps, num_outputs=self.FLAGS.hidden_size)
 
         # Use softmax layer to compute probability distribution for start location
         # Note this produces self.logits_start and self.probdist_start, both of which have shape (batch_size, context_len)
