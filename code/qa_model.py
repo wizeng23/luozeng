@@ -30,11 +30,7 @@ from tensorflow.python.ops import embedding_ops
 from evaluate import exact_match_score, f1_score
 from data_batcher import get_batch_generator
 from pretty_print import print_example
-<<<<<<< HEAD
-from modules import Params, RNNEncoder, SimpleSoftmaxLayer, Attention
-=======
-from modules import RNNEncoder, SimpleSoftmaxLayer, BasicAttn, AnswerPointer
->>>>>>> answer-pointer
+from modules import Params, RNNEncoder, Attention, AnswerPointer
 
 logging.basicConfig(level=logging.INFO)
 
@@ -141,7 +137,7 @@ class QAModel(object):
           self.probdist_start, self.probdist_end: Both shape (batch_size, context_len). Each row sums to 1.
             These are the result of taking (masked) softmax of logits_start and logits_end.
         """
-        params = Params(self.FLAGS.hidden_size)
+        params = Params(self.FLAGS.hidden_size, self.FLAGS.question_len)
         # Use a RNN to get hidden states for the context and the question
         # Note: here the RNNEncoder is shared (i.e. the weights are the same)
         # between the context and the question.
@@ -151,18 +147,28 @@ class QAModel(object):
 
         # Use context hidden states to attend to question hidden states
         attn_layer = Attention(self.keep_prob, self.FLAGS.hidden_size)
-        gated_weights = (((params["W_uQ"], params["W_uP"], params["W_vP"]), params["v"]), params["W_g"])
+        gated_weights = {"attn_params": {"weights": (params["W_uQ"], params["W_uP"], params["W_vP"]),
+                                        "v":params["v"]},
+                        "W_g": params["W_g"]}
         # gated_output is shape (batch_size, context_len, hidden_size)
         gated_output = attn_layer.build_graph(context_hiddens, self.context_mask, question_hiddens, self.qn_mask, gated_weights, False)
 
         # Use question aware context hidden states to attend to itself
-        self_attn_weights = (((params["W_vP"], params["W_vPhat"]), params["v"]), params["W_g_self"])
+        self_attn_weights = {"attn_params": {"weights": (params["W_vP"], params["W_vPhat"]),
+                                            "v":params["v"]},
+                        "W_g": params["W_g_self"]}
         # self_attn_output is shape (batch_size, context_len, 2*hidden_size)
         self_attn_output = attn_layer.build_graph(gated_output, self.context_mask, gated_output, self.context_mask, self_attn_weights, True)        
 
-        ans_point = AnswerPointer(self.FLAGS.hidden_size*4, self.FLAGS.hidden_size*2, self.FLAGS.question_len, self.FLAGS.context_len)
+        # Attend to the self-attended hidden states twice to produce the final probability distributions
+        output_weights = {"init_attn_params": {"weights": (params["W_uQ"], params["W_vQ"]),
+                                            "v":params["v"]},
+                        "attn_params": {"weights": (params["W_hP"], params["W_ha"]),
+                                            "v":params["v"]},
+                        "V_rQ": params["V_rQ"]}
+        ans_point = AnswerPointer(self.FLAGS.hidden_size, self.keep_prob)
         self.logits_start, self.probdist_start, self.logits_end, self.probdist_end = \
-            ans_point.build_graph(question_hiddens, blended_reps_final, self.qn_mask, self.context_mask)
+            ans_point.build_graph(self_attn_output, output_weights, question_hiddens, self.qn_mask, self.context_mask)
 
 
     def add_loss(self):

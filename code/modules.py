@@ -21,12 +21,13 @@ from tensorflow.python.ops import variable_scope as vs
 from tensorflow.python.ops import rnn_cell
 import pdb
 
-def Params(hidden_size):
+def Params(hidden_size, question_len):
     """
     All of the parameters used in the network
     """
     with tf.variable_scope("params"):
         h = hidden_size
+        # TODO: write comments for each of these, purpose and where used
         return {"W_uQ":tf.get_variable("W_uQ",shape=(2*h, h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
                 "W_uP":tf.get_variable("W_uP", shape=(2*h, h), dtype=tf.float32,
@@ -39,12 +40,14 @@ def Params(hidden_size):
                     initializer=tf.contrib.layers.xavier_initializer()),
                 "W_g_self":tf.get_variable("W_g_self", shape=(2*h, 2*h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
-                # "W_hP":tf.get_variable("W_hP", shape=(2*h, h), dtype=tf.float32,
-                #     initializer=tf.contrib.layers.xavier_initializer()),
-                # "W_ha":tf.get_variable("W_ha", shape=(2*h, h), dtype=tf.float32,
-                #     initializer=tf.contrib.layers.xavier_initializer()),
-                # "W_vQ":tf.get_variable("W_vQ", shape=(h, h), dtype=tf.float32,
-                #     initializer=tf.contrib.layers.xavier_initializer()),
+                "W_hP":tf.get_variable("W_hP", shape=(2*h, h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer()),
+                "W_ha":tf.get_variable("W_ha", shape=(2*h, h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer()),
+                "W_vQ":tf.get_variable("W_vQ", shape=(h, h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer()),
+                "V_rQ":tf.get_variable("V_rQ", shape=(question_len, h), dtype=tf.float32,
+                    initializer=tf.contrib.layers.xavier_initializer()),
                 "v":tf.get_variable("v", shape=(h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer())}
 
@@ -78,10 +81,10 @@ class RNNEncoder(object):
         self.rnn_cell_bw = rnn_cell.GRUCell(self.hidden_size)
         self.rnn_cell_bw = DropoutWrapper(self.rnn_cell_bw, input_keep_prob=self.keep_prob)
 
-    def build_graph(self, blended_reps, masks):
+    def build_graph(self, inputs, masks):
         """
         Inputs:
-          blended_reps: Tensor shape (batch_size, seq_len, input_size)
+          inputs: Tensor shape (batch_size, seq_len, input_size)
           masks: Tensor shape (batch_size, seq_len).
             Has 1s where there is real input, 0s where there's padding.
             This is used to make sure tf.nn.bidirectional_dynamic_rnn doesn't iterate through masked steps.
@@ -111,44 +114,6 @@ class RNNEncoder(object):
             return out
 
 
-class SimpleSoftmaxLayer(object):
-    """
-    Module to take set of hidden states, (e.g. one for each context location),
-    and return probability distribution over those states.
-    """
-
-    def __init__(self):
-        pass
-
-    def build_graph(self, blended_reps, masks):
-        """
-        Applies one linear downprojection layer, then softmax.
-
-        Inputs:
-          blended_reps: Tensor shape (batch_size, seq_len, hidden_size)
-          masks: Tensor shape (batch_size, seq_len)
-            Has 1s where there is real input, 0s where there's padding.
-
-        Outputs:
-          logits: Tensor shape (batch_size, seq_len)
-            logits is the result of the downprojection layer, but it has -1e30
-            (i.e. very large negative number) in the padded locations
-          prob_dist: Tensor shape (batch_size, seq_len)
-            The result of taking softmax over logits.
-            This should have 0 in the padded locations, and the rest should sum to 1.
-        """
-        with vs.variable_scope("SimpleSoftmaxLayer"):
-
-            # Linear downprojection layer
-            logits = tf.contrib.layers.fully_connected(blended_reps, num_outputs=1, activation_fn=None) # shape (batch_size, seq_len, 1)
-            logits = tf.squeeze(logits, axis=[2]) # shape (batch_size, seq_len)
-
-            # Take softmax over sequence
-            masked_logits, prob_dist = masked_softmax(logits, masks, 1)
-
-            return masked_logits, prob_dist
-
-
 class Attention(object):
     """
     Since attention is calculated as a layer twice (gated and self-attention), we created a single
@@ -159,12 +124,12 @@ class Attention(object):
         self.hidden_size = hidden_size
         self.keep_prob = keep_prob
 
-    def build_graph(self, inputs, inputs_mask, memory, memory_mask, weights, self_matching):
+    def build_graph(self, inputs, inputs_mask, memory, memory_mask, params, self_matching):
         with vs.variable_scope("GatedAttn"):
-            cell = Attended_Rnn(self.hidden_size, memory, memory_mask, weights, self_matching)
+            cell = Attended_Rnn(self.hidden_size, memory, memory_mask, params, self_matching)
             cell = DropoutWrapper(cell, input_keep_prob=self.keep_prob)
             if self_matching:
-                cell_bw = Attended_Rnn(self.hidden_size, memory, memory_mask, weights, self_matching)
+                cell_bw = Attended_Rnn(self.hidden_size, memory, memory_mask, params, self_matching)
                 cell_bw = DropoutWrapper(cell_bw, input_keep_prob=self.keep_prob)
             inputs_masked_len = tf.reduce_sum(inputs_mask, 1)
             if not self_matching:
@@ -211,12 +176,13 @@ def attend_inputs(inputs, state, memory, memory_mask, hidden_size, params, self_
     memory: shape (batch_size, question_len, 2*hidden_size)
     """
     with tf.variable_scope("attend_inputs"):
-        params, W_g = params
+        attn_params = params["attn_params"]
+        W_g = params["W_g"]
         attn_inputs = [memory, inputs]
         if not self_matching:
             state = tf.reshape(state, (-1, hidden_size))
             attn_inputs.append(state)
-        attn_dist = attention(params, attn_inputs, memory_mask, hidden_size)
+        _, attn_dist = attention(attn_params, attn_inputs, memory_mask, hidden_size)
         attn_dist = tf.expand_dims(attn_dist, 2)
         attn_output = tf.reduce_sum(attn_dist * memory, 1) # shape (batch_size, memory_hidden_size)
         new_inputs = tf.concat([inputs, attn_output], 1)
@@ -224,7 +190,7 @@ def attend_inputs(inputs, state, memory, memory_mask, hidden_size, params, self_
         return g * new_inputs
 
 
-def attention(params, inputs, memory_mask, hidden_size):
+def attention(attn_params, inputs, memory_mask, hidden_size):
     """
     TODO: update
     inputs: shape (batch_size, 2*hidden_size)
@@ -236,7 +202,8 @@ def attention(params, inputs, memory_mask, hidden_size):
 
     """
     with tf.variable_scope("attention"):
-        weights, v = params
+        weights = attn_params["weights"]
+        v = attn_params["v"]
         results = []
         for weight, ainput in zip(weights, inputs):
             input_shape = ainput.shape.as_list()
@@ -250,8 +217,7 @@ def attention(params, inputs, memory_mask, hidden_size):
                 result = tf.expand_dims(result, 0)
             results.append(result)
         s = tf.reduce_sum(tf.tanh(sum(results)) * v, [-1]) # shape (batch_size, memory_len)
-        _, attn_dist = masked_softmax(s, memory_mask, 1)
-        return attn_dist
+        return masked_softmax(s, memory_mask, 1)
 
 
 class AnswerPointer(object):
@@ -259,21 +225,20 @@ class AnswerPointer(object):
     Uses the Ptr-Net model to predict both the start and end indices of the answer.
     """
 
-    def __init__(self, hidden_size, attn_hidden_size, question_len, context_len):
-        self.hidden_size = hidden_size # 4*h, 8*h after self-attention
-        self.attn_hidden_size = attn_hidden_size # 2*h
-        self.question_len = question_len
-        self.context_len = context_len
+    def __init__(self, hidden_size, keep_prob):
+        self.hidden_size = hidden_size
+        self.keep_prob = keep_prob
 
-    def build_graph(self, question_hiddens, context_hiddens, question_mask, context_mask):
+    def build_graph(self, self_attn_output, params, question_hiddens, question_mask, context_mask):
         """
         The output layer of r-net, an answer pointer network
 
         Inputs:
-          question_hiddens: shape (batch_size, question_len, attn_hidden_size)
-          context_hiddens: shape (batch_size, context_len, hidden_size)
-          question_mask: shape (batch_size, question_len)
-          context_mask: shape (batch_size, context_len)
+            self_attn_output: 
+            params: 
+            question_hiddens: 
+            question_mask: 
+            context_mask: 
 
         Outputs:
           logits_start: raw logits before softmax
@@ -282,57 +247,22 @@ class AnswerPointer(object):
           probdist_end: probability distribution of the end index
         """
         with vs.variable_scope("AnswerPointer"):
-            question_len = self.question_len
-            context_len = self.context_len
-            attn_hidden_size = self.attn_hidden_size
-            hidden_size = self.hidden_size
-            W_uQ = tf.get_variable("W_uQ", shape=(attn_hidden_size, attn_hidden_size),
-                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
-            W_vQ = tf.get_variable("W_vQ", shape=(attn_hidden_size, attn_hidden_size),
-                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
-
-            V_rQ = tf.get_variable("V_rQ", shape=(question_len, attn_hidden_size),
-                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
-            v = tf.get_variable("v", shape=(attn_hidden_size,),
-                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
-
-            question_hiddens = tf.reshape(question_hiddens, (-1, attn_hidden_size))
-            WuQ = tf.matmul(question_hiddens, W_uQ)
-            WuQ = tf.reshape(WuQ, (-1, question_len, attn_hidden_size))
-            WvQ = tf.matmul(V_rQ, W_vQ)
-            WvQ = tf.expand_dims(WvQ, 0)
-            pointnet_s = tf.reduce_sum(tf.tanh(WuQ + WvQ) * v, 2) # shape (batch_size, question_len)
-            _, pointnet_a = masked_softmax(pointnet_s, question_mask, 1)
-            pointnet_a = tf.expand_dims(pointnet_a, axis=1) # shape (batch_size, 1, question_len)
-            question_hiddens = tf.reshape(question_hiddens, (-1, question_len, attn_hidden_size))
-            pointnet_rQ = tf.matmul(pointnet_a, question_hiddens)
-            pointnet_hidden = tf.squeeze(pointnet_rQ, axis=1) # shape (batch_size, attn_hidden_size)
-
-            W_hP = tf.get_variable("W_hP", shape=(hidden_size, attn_hidden_size),
-                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
-            W_ha = tf.get_variable("W_ha", shape=(attn_hidden_size, attn_hidden_size),
-                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
-            context_hiddens = tf.reshape(context_hiddens, (-1, hidden_size))
-            Whp = tf.matmul(context_hiddens, W_hP)
-            # shape (batch_size, context_len, attn_hidden_size)
-            Whp = tf.reshape(Whp, (-1, context_len, attn_hidden_size))
-            Wha = tf.matmul(pointnet_hidden, W_ha) # shape (batch_size, attn_hidden_size)
-            Wha = tf.expand_dims(Wha, 1)
-            tanh = tf.tanh(Whp + Wha) # shape (batch_size, context_len, attn_hidden_size)
-            s = tf.reduce_sum(tanh * v, 2)
-            logits_start, probdist_start = masked_softmax(s, context_mask, 1)
-            a = tf.expand_dims(probdist_start, axis=1) # shape (batch_size, 1, context_len)
-            context_hiddens = tf.reshape(context_hiddens, (-1, context_len, hidden_size))
-            c = tf.matmul(a, context_hiddens) # shape (batch_size, 1, hidden_size)
-            rnn_input = tf.squeeze(c, axis=1) # shape (batch_size, hidden_size)
-            ans_point_rnn = rnn_cell.GRUCell(attn_hidden_size)
-            _, pointnet_hidden = tf.nn.static_rnn(ans_point_rnn, [rnn_input], initial_state=pointnet_hidden, dtype=tf.float32)
-
-            Wha2 = tf.matmul(pointnet_hidden, W_ha) # shape (batch_size, attn_hidden_size)
-            Wha2 = tf.expand_dims(Wha2, 1)
-            tanh2 = tf.tanh(Whp + Wha2) # shape (batch_size, context_len, attn_hidden_size)
-            s2 = tf.reduce_sum(tanh2 * v, 2)
-            logits_end, probdist_end = masked_softmax(s2, context_mask, 1)
+            init_attn_params = params["init_attn_params"]
+            attn_params = params["attn_params"]
+            V_rQ = params["V_rQ"]
+            init_attn_inputs = [question_hiddens, V_rQ]
+            _, init_attn_dist = attention(init_attn_params, init_attn_inputs, question_mask, self.hidden_size)
+            init_attn_dist = tf.expand_dims(init_attn_dist, 2)
+            init_state = tf.reduce_sum(init_attn_dist * question_hiddens, 1) # shape (batch_size, 2*hidden_state)
+            attn_inputs = [self_attn_output, init_state]
+            logits_start, probdist_start = attention(attn_params, attn_inputs, context_mask, self.hidden_size)
+            attn_dist = tf.expand_dims(probdist_start, 2)
+            rnn_input = tf.reduce_sum(attn_dist * self_attn_output, 1) # shape (batch_size, 2*hidden_state)
+            ans_point_rnn = rnn_cell.GRUCell(2*self.hidden_size)
+            ans_point_rnn = DropoutWrapper(ans_point_rnn, input_keep_prob=self.keep_prob)
+            _, state = tf.nn.static_rnn(ans_point_rnn, [rnn_input], initial_state=init_state, dtype=tf.float32)
+            attn_inputs2 = [self_attn_output, state]
+            logits_end, probdist_end = attention(attn_params, attn_inputs2, context_mask, self.hidden_size)
             return logits_start, probdist_start, logits_end, probdist_end
 
 
