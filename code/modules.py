@@ -213,17 +213,17 @@ class AnswerPointer(object):
             W_vQ = tf.get_variable("W_vQ", shape=(attn_hidden_size, attn_hidden_size),
                 dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
 
-            V_rQ = tf.get_variable("V_rQ", shape=(attn_hidden_size, 1),
+            V_rQ = tf.get_variable("V_rQ", shape=(question_len, attn_hidden_size),
                 dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
-            pointnet_v = tf.get_variable("pointnet_v", shape=(attn_hidden_size, 1),
+            v = tf.get_variable("v", shape=(attn_hidden_size,),
                 dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
 
             question_hiddens = tf.reshape(question_hiddens, (-1, attn_hidden_size))
             WuQ = tf.matmul(question_hiddens, W_uQ)
-            WvQ = tf.matmul(W_vQ, V_rQ)
-            WvQ = tf.reshape(WvQ, (1, attn_hidden_size))
-            pointnet_s = tf.matmul(tf.tanh(WuQ + WvQ), pointnet_v) # shape (batch_size*question_len, 1)
-            pointnet_s = tf.reshape(pointnet_s, (-1, question_len)) # shape (batch_size, question_len)
+            WuQ = tf.reshape(WuQ, (-1, question_len, attn_hidden_size))
+            WvQ = tf.matmul(V_rQ, W_vQ)
+            WvQ = tf.expand_dims(WvQ, 0)
+            pointnet_s = tf.reduce_sum(tf.tanh(WuQ + WvQ) * v, 2) # shape (batch_size, question_len)
             _, pointnet_a = masked_softmax(pointnet_s, question_mask, 1)
             pointnet_a = tf.expand_dims(pointnet_a, axis=1) # shape (batch_size, 1, question_len)
             question_hiddens = tf.reshape(question_hiddens, (-1, question_len, attn_hidden_size))
@@ -234,8 +234,6 @@ class AnswerPointer(object):
                 dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
             W_ha = tf.get_variable("W_ha", shape=(attn_hidden_size, attn_hidden_size),
                 dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
-            output_v = tf.get_variable("output_v", shape=(attn_hidden_size, 1),
-                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
             context_hiddens = tf.reshape(context_hiddens, (-1, hidden_size))
             Whp = tf.matmul(context_hiddens, W_hP)
             # shape (batch_size, context_len, attn_hidden_size)
@@ -243,9 +241,7 @@ class AnswerPointer(object):
             Wha = tf.matmul(pointnet_hidden, W_ha) # shape (batch_size, attn_hidden_size)
             Wha = tf.expand_dims(Wha, 1)
             tanh = tf.tanh(Whp + Wha) # shape (batch_size, context_len, attn_hidden_size)
-            tanh = tf.reshape(tanh, (-1, attn_hidden_size))
-            s = tf.matmul(tanh, output_v)
-            s = tf.reshape(s, (-1, context_len)) # shape (batch_size, context_len)
+            s = tf.reduce_sum(tanh * v, 2)
             logits_start, probdist_start = masked_softmax(s, context_mask, 1)
             a = tf.expand_dims(probdist_start, axis=1) # shape (batch_size, 1, context_len)
             context_hiddens = tf.reshape(context_hiddens, (-1, context_len, hidden_size))
@@ -257,9 +253,7 @@ class AnswerPointer(object):
             Wha2 = tf.matmul(pointnet_hidden, W_ha) # shape (batch_size, attn_hidden_size)
             Wha2 = tf.expand_dims(Wha2, 1)
             tanh2 = tf.tanh(Whp + Wha2) # shape (batch_size, context_len, attn_hidden_size)
-            tanh2 = tf.reshape(tanh2, (-1, attn_hidden_size))
-            s2 = tf.matmul(tanh2, output_v)
-            s2 = tf.reshape(s2, (-1, context_len)) # shape (batch_size, context_len)
+            s2 = tf.reduce_sum(tanh2 * v, 2)
             logits_end, probdist_end = masked_softmax(s2, context_mask, 1)
             return logits_start, probdist_start, logits_end, probdist_end
 
