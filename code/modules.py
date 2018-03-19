@@ -15,6 +15,7 @@
 """This file contains some basic model components"""
 
 import tensorflow as tf
+from tensorflow.contrib.rnn import RNNCell
 from tensorflow.python.ops.rnn_cell import DropoutWrapper
 from tensorflow.python.ops import variable_scope as vs
 from tensorflow.python.ops import rnn_cell
@@ -174,6 +175,79 @@ class BasicAttn(object):
             output = tf.nn.dropout(output, self.keep_prob)
 
             return attn_dist, output
+
+
+class Attended_Rnn(RNNCell):
+  def __init__(self, hidden_size, memory, memory_mask, memory_len, weights, self_matching):
+    super(RNNCell, self).__init__()
+    self.cell = rnn_cell.GRUCell(hidden_size)
+    self.hidden_size = hidden_size
+    self.memory = memory
+    self.memory_mask = memory_mask
+    self.memory_len = memory_len
+    self.weights = weights
+    self.self_matching = self_matching
+
+  @property
+  def state_size(self):
+    return self.hidden_size
+
+  @property
+  def output_size(self):
+    return self.hidden_size
+
+  def __call__(self, inputs, state, scope = None):
+    """Gated recurrent unit (GRU) with nunits cells."""
+    inputs = attend_inputs(inputs, state, self.memory, self.memory_mask, self.memory_len, self.hidden_size, self.weights, self.self_matching)
+    output, new_state = self._cell(inputs, state, scope)
+    return output, new_state
+
+
+def attend_inputs(inputs, state, memory, memory_mask, memory_len, hidden_size, weights, self_matching):
+    """
+    inputs: shape (batch_size, 2*hidden_size)
+    state: shape (batch_size, hidden_size)
+    memory: shape (batch_size, question_len, 2*hidden_size)
+    """
+    with tf.variable_scope("attend_inputs"):
+        weights, W_g = weights
+        attn_inputs = [memory, inputs]
+        if not self_matching:
+            state = tf.reshape(state, (-1, hidden_size))
+            attn_inputs.append(state)
+        attention(weights, attn_inputs, memory_len, hidden_size)
+
+
+def attention(weights, inputs, memory_len, memory_mask, hidden_size):
+    """
+    TODO: update
+    inputs: shape (batch_size, 2*hidden_size)
+    state: shape (batch_size, hidden_size)
+    memory: shape (batch_size, question_len, 2*hidden_size)
+    wuq 2hxh
+    wup hxh
+    wvp 2hxh
+
+    """
+    with tf.variable_scope("attention"):
+        weights, v = weights
+        results = []
+        for weight, ainput in zip(weights, inputs):
+            shape = ainput.shape
+            ainput = tf.reshape(ainput, (-1, hidden_size))
+            result = tf.matmul(ainput, weight)
+            if len(shape) > 2:
+                result = tf.reshape(result, (-1, shape[1], hidden_size))
+            else:
+                result = tf.expand_dims(result, 1)
+            results.append(result)
+        results = tf.tanh(sum(results)) # shape (batch_size, memory_len, hidden_size)
+        scores = tf.reduce_sum(tf.tanh(results) * v, [-1])
+        results = tf.reshape(results, -1, hidden_size)
+        s = tf.matmul(results, v)
+        s = tf.reshape(s, (-1, memory_len))
+        _, attn_dist = masked_softmax(s, memory_mask, 1)
+        return attn_dist
 
 
 def masked_softmax(logits, mask, dim):
