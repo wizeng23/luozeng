@@ -155,49 +155,28 @@ class QAModel(object):
         context_hiddens = encoder.build_graph(self.context_embs, self.context_mask) # (batch_size, context_len, 2*hidden_size)
         question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask) # (batch_size, question_len, 2*hidden_size)
 
-        # context_char_hiddens = CharCNN(self.keep_prob).build_graph(self.context_char_embs)
-        # concat??
-
         # Use context hidden states to attend to question hidden states
         attn_layer = Attention(self.keep_prob, self.FLAGS.hidden_size)
-        gated_weights = (((params["W_uQ"], params["W_uP"], params["W_vQ"]), params["v"]), params["W_g"])
+        gated_weights = (((params["W_uQ"], params["W_uP"], params["W_vP"]), params["v"]), params["W_g"])
         # gated_output is shape (batch_size, context_len, hidden_size)
         gated_output = attn_layer.build_graph(context_hiddens, self.context_mask, question_hiddens, self.qn_mask, gated_weights, False)
 
-        # Concat attn_output to context_hiddens to get blended_reps
-        blended_reps = tf.concat([context_hiddens, gated_output], 2) # (batch_size, context_len, 3*hidden_size)
-
-        # Send the blended_reps into a one-directional GRU to get question-aware context hidden states
-        qa_context_hiddens = RNNAttn(self.FLAGS.hidden_size*4, self.keep_prob).build_graph(blended_reps, self.context_mask)
-
-        # use self-attention for the question-aware context hidden states themselves
-        sf_attn_layer = SelfAttn(self.keep_prob, self.FLAGS.hidden_size*4, self.FLAGS.context_len)
-        _, sf_attn_output = sf_attn_layer.build_graph(qa_context_hiddens, self.context_mask)
-        # self_attn_output is shape (batch_size, context_len, hidden_size*4)
-
-        # concatenate self-attention output to the question-aware context hidden states
-        blended_self_attn = tf.concat([qa_context_hiddens, sf_attn_output], axis=2) # (batch_size, context_len, hidden_size*8)
-
-        # and pass these as input to a bidirectional RNN to obtain a new set of hidden states
-        new_hidden_states = RNNEncoder2(self.FLAGS.hidden_size*8, self.keep_prob).build_graph(blended_self_attn, self.context_mask) #(batch_size, context_len, hidden_size*8)
-
-        # Apply fully connected layer to self-attention representation
-        # Note, blended_reps_final corresponds to b' in the handout
-        # Note, tf.contrib.layers.fully_connected applies a ReLU non-linearity here by default
-        # blended_reps_final is shape (batch_size, context_len, hidden_size)
-        blended_reps_final = tf.contrib.layers.fully_connected(new_hidden_states, num_outputs=self.FLAGS.hidden_size)
+        # Use question aware context hidden states to attend to itself
+        self_attn_weights = (((params["W_vP"], params["W_vPhat"]), params["v"]), params["W_g_self"])
+        # self_attn_output is shape (batch_size, context_len, 2*hidden_size)
+        self_attn_output = attn_layer.build_graph(gated_output, self.context_mask, gated_output, self.context_mask, self_attn_weights, True)        
 
         # Use softmax layer to compute probability distribution for start location
         # Note this produces self.logits_start and self.probdist_start, both of which have shape (batch_size, context_len)
         with vs.variable_scope("StartDist"):
             softmax_layer_start = SimpleSoftmaxLayer()
-            self.logits_start, self.probdist_start = softmax_layer_start.build_graph(blended_reps_final, self.context_mask)
+            self.logits_start, self.probdist_start = softmax_layer_start.build_graph(self_attn_output, self.context_mask)
 
         # Use softmax layer to compute probability distribution for end location
         # Note this produces self.logits_end and self.probdist_end, both of which have shape (batch_size, context_len)
         with vs.variable_scope("EndDist"):
             softmax_layer_end = SimpleSoftmaxLayer()
-            self.logits_end, self.probdist_end = softmax_layer_end.build_graph(blended_reps_final, self.context_mask)
+            self.logits_end, self.probdist_end = softmax_layer_end.build_graph(self_attn_output, self.context_mask)
 
 
     def add_loss(self):

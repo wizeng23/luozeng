@@ -33,20 +33,18 @@ def Params(hidden_size):
                     initializer=tf.contrib.layers.xavier_initializer()),
                 "W_vP":tf.get_variable("W_vP", shape=(h, h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
-                "W_vP2":tf.get_variable("W_vP2", shape=(2*h, h), dtype=tf.float32,
+                "W_vPhat":tf.get_variable("W_vPhat", shape=(h, h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
                 "W_g":tf.get_variable("W_g", shape=(4*h, 4*h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
-                "W_g2":tf.get_variable("W_g2", shape=(3*h, 3*h), dtype=tf.float32,
+                "W_g_self":tf.get_variable("W_g_self", shape=(2*h, 2*h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
-                "W_hP":tf.get_variable("W_hP", shape=(2*h, h), dtype=tf.float32,
-                    initializer=tf.contrib.layers.xavier_initializer()),
-                "W_vPhat":tf.get_variable("W_vPhat", shape=(2*h, h), dtype=tf.float32,
-                    initializer=tf.contrib.layers.xavier_initializer()),
-                "W_ha":tf.get_variable("W_ha", shape=(2*h, h), dtype=tf.float32,
-                    initializer=tf.contrib.layers.xavier_initializer()),
-                "W_vQ":tf.get_variable("W_vQ", shape=(h, h), dtype=tf.float32,
-                    initializer=tf.contrib.layers.xavier_initializer()),
+                # "W_hP":tf.get_variable("W_hP", shape=(2*h, h), dtype=tf.float32,
+                #     initializer=tf.contrib.layers.xavier_initializer()),
+                # "W_ha":tf.get_variable("W_ha", shape=(2*h, h), dtype=tf.float32,
+                #     initializer=tf.contrib.layers.xavier_initializer()),
+                # "W_vQ":tf.get_variable("W_vQ", shape=(h, h), dtype=tf.float32,
+                #     initializer=tf.contrib.layers.xavier_initializer()),
                 "v":tf.get_variable("v", shape=(h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer())}
 
@@ -165,9 +163,19 @@ class Attention(object):
         with vs.variable_scope("GatedAttn"):
             cell = Attended_Rnn(self.hidden_size, memory, memory_mask, weights, self_matching)
             cell = DropoutWrapper(cell, input_keep_prob=self.keep_prob)
+            if self_matching:
+                cell_bw = Attended_Rnn(self.hidden_size, memory, memory_mask, weights, self_matching)
+                cell_bw = DropoutWrapper(cell_bw, input_keep_prob=self.keep_prob)
             inputs_masked_len = tf.reduce_sum(inputs_mask, 1)
-            # outputs shape (batch_size, context_len, hidden_size)
-            outputs, _ = tf.nn.dynamic_rnn(cell, inputs, sequence_length=inputs_masked_len, dtype=tf.float32)
+            if not self_matching:
+                # outputs shape (batch_size, context_len, hidden_size)
+                outputs, _ = tf.nn.dynamic_rnn(cell, inputs,
+                    sequence_length=inputs_masked_len, dtype=tf.float32)
+            else:
+                (fw_out, bw_out), _ = tf.nn.bidirectional_dynamic_rnn(cell, cell_bw, inputs,
+                    sequence_length=inputs_masked_len, dtype=tf.float32)
+                # outputs shape (batch_size, context_len, 2*hidden_size)
+                outputs = tf.concat((fw_out, bw_out), 2)
             return outputs
 
 
@@ -210,7 +218,7 @@ def attend_inputs(inputs, state, memory, memory_mask, hidden_size, params, self_
             attn_inputs.append(state)
         attn_dist = attention(params, attn_inputs, memory_mask, hidden_size)
         attn_dist = tf.expand_dims(attn_dist, 2)
-        attn_output = tf.reduce_sum(attn_dist * memory, 1) # shape (batch_size, 2*hidden_size)
+        attn_output = tf.reduce_sum(attn_dist * memory, 1) # shape (batch_size, memory_hidden_size)
         new_inputs = tf.concat([inputs, attn_output], 1)
         g = tf.sigmoid(tf.matmul(new_inputs, W_g)) # shape (batch_size, 4*hidden_size)
         return g * new_inputs
@@ -246,193 +254,6 @@ def attention(params, inputs, memory_mask, hidden_size):
         return attn_dist
 
 
-class RNNAttn(object):
-
-    def __init__(self, hidden_size, keep_prob):
-        """
-        Inputs:
-          hidden_size: int. Hidden size of the RNN
-          keep_prob: Tensor containing a single scalar that is the keep probability (for dropout)
-        """
-        self.hidden_size = hidden_size
-        self.keep_prob = keep_prob
-        self.rnn_cell = rnn_cell.GRUCell(self.hidden_size)
-        self.rnn_cell = DropoutWrapper(self.rnn_cell, input_keep_prob=self.keep_prob)
-
-    def build_graph(self, inputs, masks):
-        """
-        Inputs:
-          inputs: Tensor shape (batch_size, seq_len, hidden_size*4)
-          masks: Tensor shape (batch_size, seq_len).
-            Has 1s where there is real input, 0s where there's padding.
-
-        Returns:
-          out: Tensor shape (batch_size, seq_len, hidden_size*4).
-
-        """
-        with vs.variable_scope("RNN_attn"):
-
-            input_lens = tf.reduce_sum(masks, reduction_indices=1)  # shape (batch_size)
-            # Note: fw_out are the hidden states for every time step.
-            # Each is shape (batch_size, seq_len, hidden_size*4).
-            fw_out, _ = tf.nn.dynamic_rnn(self.rnn_cell, inputs, input_lens, dtype=tf.float32)
-
-            # Apply dropout
-            out = tf.nn.dropout(fw_out, self.keep_prob)
-
-            return out
-
-
-class SelfAttn(object):
-
-    def __init__(self, keep_prob, vec_size, context_len):
-        """
-        Inputs:
-          keep_prob: tensor containing a single scalar that is the keep probability (for dropout)
-          key_vec_size: size of the key vectors. int
-        """
-        self.keep_prob = keep_prob
-        self.vec_size = vec_size
-        self.context_len = context_len
-        # vector size here is hidden_size*4
-
-    def build_graph(self, reps, mask):
-        """
-        representations attend to themselves.
-        For each representation, return an attention distribution and an attention output vector.
-
-        Inputs:
-          inputs: Tensor shape (batch_size, context_len, hidden_size*4)
-          masks: Tensor shape (batch_size, context_len).
-            Has 1s where there is real input, 0s where there's padding.
-
-        Outputs:
-          attn_dist: Tensor shape (batch_size, context_len, context_len).
-            For each key, the distribution should sum to 1,
-            and should be 0 in the value locations that correspond to padding.
-
-          output: Tensor shape Tensor shape (batch_size, context_len, hidden_size*4).
-            This is the attention output; the weighted sum of the values
-            (using the attention distribution as weights).
-
-        """
-        with vs.variable_scope("SelfAttn"):
-
-            W_1 = tf.get_variable("W_1", shape = [self.vec_size, self.vec_size],
-                                  dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
-            W_2 = tf.get_variable("W_2", shape= [self.vec_size, self.vec_size],
-                                  dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
-            # W_1, W_2 shape (hidden_size*4, hidden_size*4)
-
-            v = tf.get_variable("v", shape= [self.vec_size, 1],
-                                dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer())
-            # v vector shape (hidden_size*4)
-
-            # Calculate self attention distribution
-            reps = tf.reshape(reps, [-1, self.vec_size])
-            vw1 = tf.matmul(reps, W_1)
-            vw1 = tf.reshape(vw1, [-1, self.context_len, self.vec_size])
-            # shape (batch_size, context_len, hidden_size*4)
-
-            vw2 = tf.matmul(reps, W_2)
-            vw2 = tf.reshape(vw2, [-1, self.context_len, self.vec_size])
-            # shape (batch_size, context_len, hidden_size*4)
-
-            sf_attn_logits = []
-            # shape would be (batch_size, context_len, context_len) when completed
-
-            for i in xrange(self.context_len):
-                # pdb.set_trace()
-
-                vivj = tf.reshape(tf.tanh(vw1[:, i:(i+1), :] + vw2), [-1, self.vec_size])
-                # vivj is shape (batch_size*context_len, hidden_size*4)
-
-                temp = tf.matmul(vivj, v)
-                temp = tf.reshape(temp, [-1, self.context_len])
-                # (batch_size, context_len)
-
-                sf_attn_logits.append(temp)
-
-            sf_attn_logits = tf.stack(sf_attn_logits, axis=1)
-
-            sf_attn_logits_mask = tf.expand_dims(mask, 1)
-            # shape (batch_size, 1, context_len)
-
-            _, sf_attn_dist = masked_softmax(sf_attn_logits, sf_attn_logits_mask, 2)
-            # shape (batch_size, context_len, context_len). take softmax over
-
-            # Use attention distribution to take weighted sum of values
-            reps = tf.reshape(reps, [-1, self.context_len, self.vec_size])
-            output = tf.matmul(sf_attn_dist, reps) # shape (batch_size, context_len, hidden_size*4)
-
-            # Apply dropout
-            output = tf.nn.dropout(output, self.keep_prob)
-
-            return sf_attn_dist, output
-
-
-class RNNEncoder2(object):
-    """
-    General-purpose module to encode a sequence using a RNN.
-    It feeds the input through a RNN and returns all the hidden states.
-
-    Note: In lecture 8, we talked about how you might use a RNN as an "encoder"
-    to get a single, fixed size vector representation of a sequence
-    (e.g. by taking element-wise max of hidden states).
-    Here, we're using the RNN as an "encoder" but we're not taking max;
-    we're just returning all the hidden states. The terminology "encoder"
-    still applies because we're getting a different "encoding" of each
-    position in the sequence, and we'll use the encodings downstream in the model.
-
-    This code uses a bidirectional GRU, but you could experiment with other types of RNN.
-    """
-
-    def __init__(self, hidden_size, keep_prob):
-        """
-        Inputs:
-          hidden_size: int. Hidden size of the RNN
-          keep_prob: Tensor containing a single scalar that is the keep probability (for dropout)
-        """
-        self.hidden_size = hidden_size
-        self.keep_prob = keep_prob
-        self.rnn_cell_fw = rnn_cell.GRUCell(self.hidden_size)
-        self.rnn_cell_fw = DropoutWrapper(self.rnn_cell_fw, input_keep_prob=self.keep_prob)
-        self.rnn_cell_bw = rnn_cell.GRUCell(self.hidden_size)
-        self.rnn_cell_bw = DropoutWrapper(self.rnn_cell_bw, input_keep_prob=self.keep_prob)
-
-    def build_graph(self, inputs, masks):
-        """
-        Inputs:
-          inputs: Tensor shape (batch_size, seq_len, input_size)
-          masks: Tensor shape (batch_size, seq_len).
-            Has 1s where there is real input, 0s where there's padding.
-            This is used to make sure tf.nn.bidirectional_dynamic_rnn doesn't iterate through masked steps.
-
-        Returns:
-          out: Tensor shape (batch_size, seq_len, hidden_size*2).
-            This is all hidden states (fw and bw hidden states are concatenated).
-        """
-        with vs.variable_scope("RNNEncoder2"):
-
-            if masks is not None:
-                input_lens = tf.reduce_sum(masks, reduction_indices=1) # shape (batch_size)
-                (fw_out, bw_out), _ = tf.nn.bidirectional_dynamic_rnn(self.rnn_cell_fw, self.rnn_cell_bw, inputs,
-                                                                      input_lens, dtype=tf.float32)
-            else:
-                (fw_out, bw_out), _ = tf.nn.bidirectional_dynamic_rnn(self.rnn_cell_fw, self.rnn_cell_bw, inputs,
-                                                                      dtype=tf.float32)
-            # Note: fw_out and bw_out are the hidden states for every time step.
-            # Each is shape (batch_size, seq_len, hidden_size).
-
-            # Concatenate the forward and backward hidden states
-            out = tf.concat([fw_out, bw_out], 2)
-
-            # Apply dropout
-            out = tf.nn.dropout(out, self.keep_prob)
-
-            return out
-
-
 def masked_softmax(logits, mask, dim):
     """
     Takes masked softmax over given dimension of logits.
@@ -456,45 +277,3 @@ def masked_softmax(logits, mask, dim):
     masked_logits = tf.add(logits, exp_mask) # where there's padding, set logits to -large
     prob_dist = tf.nn.softmax(masked_logits, dim)
     return masked_logits, prob_dist
-
-
-# class CharCNN(object):
-#     """
-#     A character-level CNN for input layer
-#
-#     module to encode a character-based sequence using a CNN.
-#     It feeds the input through a CNN and returns all the hidden states.
-#     """
-#
-#     def __init__(self, keep_prob):
-#         """
-#         Inputs:
-#           hidden_size: int. Hidden size of the CNN
-#           keep_prob: Tensor containing a single scalar that is the keep probability (for dropout)
-#         """
-#         self.hidden_size = 100
-#         self.keep_prob = keep_prob
-#
-#     def build_graph(self, inputs):
-#
-#         with vs.variable_scope("charCNN"):
-#
-#             filter_shape = [num_quantized_chars, filter_sizes[0], 1, num_filters_per_size]
-#             W = tf.Variable(tf.truncated_normal(filter_shape, stddev=0.05), name="W")
-#             b = tf.Variable(tf.constant(0.1, shape=[num_filters_per_size]), name="b")
-#             conv = tf.nn.conv2d(self.input_x, W, strides=[1, 1, 1, 1], padding="VALID", name="conv1")
-#             h = tf.nn.relu(tf.nn.bias_add(conv, b), name="relu")
-#             pooled = tf.nn.max_pool(
-#                 h,
-#                 ksize=[1, 1, 3, 1],
-#                 strides=[1, 1, 3, 1],
-#                 padding='VALID',
-#                 name="pool1")
-#
-#         num_features_total = 34 * num_filters_per_size
-#         h_pool_flat = tf.reshape(pooled, [-1, num_features_total])
-#
-#         # Add dropout
-#         out = tf.nn.dropout(h_pool_flat, self.dropout_keep_prob)
-#
-#         return out
