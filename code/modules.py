@@ -14,6 +14,25 @@
 
 """This file contains some basic model components"""
 
+"""
+Note: the design of the final model is heavily inspired by the open-source r-net implementation
+found at https://github.com/minsangkim142/R-net. When encountering problems in our code, the TA
+encouraged us to search for an open-source version to solve the problem. All of the code was only
+referenced, and our model below was all hand-coded from our understanding of it. Our painful previous
+implementation of the self-attention layer and answer pointer layer available upon request.
+
+Specific inspirations include
+- using a separate module to store all params. In addition, we also shrunk the hidden size down
+    at all layers since the r-net paper did not provide any dimensions. This helped us with
+    out-of-memory issues we were experiencing.
+- a wrapper around an RNN cell to attend the input before feeding it into the cell. a large
+    headache was figuring out how to attend the input before each time step and this was a 
+    beautiful solution to it.
+- a separate general function to calculate attention. The attention equations that are used
+    four times throughout the r-net paper are all very similar, and making it a separate function
+    dramatically improved readability.
+"""
+
 import tensorflow as tf
 from tensorflow.contrib.rnn import RNNCell
 from tensorflow.python.ops.rnn_cell import DropoutWrapper
@@ -28,26 +47,37 @@ def Params(hidden_size, question_len):
     with tf.variable_scope("params"):
         h = hidden_size
         # TODO: write comments for each of these, purpose and where used
-        return {"W_uQ":tf.get_variable("W_uQ",shape=(2*h, h), dtype=tf.float32,
+        return {# for question hidden, in GABR/pointer network
+                "W_uQ":tf.get_variable("W_uQ",shape=(2*h, h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
+                # for passage hidden, in GABR
                 "W_uP":tf.get_variable("W_uP", shape=(2*h, h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
+                # for question-aware hidden, in self-attention
                 "W_vP":tf.get_variable("W_vP", shape=(h, h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
+                # for question-aware hidden, in self-attention
                 "W_vPhat":tf.get_variable("W_vPhat", shape=(h, h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
+                # for blend of passage hidden and attention, in GABR
                 "W_g":tf.get_variable("W_g", shape=(4*h, 4*h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
+                # for blend of question-aware hidden and attention, in self-attention
                 "W_g_self":tf.get_variable("W_g_self", shape=(2*h, 2*h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
+                # for self-attnded passage hidden, in pointer network
                 "W_hP":tf.get_variable("W_hP", shape=(2*h, h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
+                # for answer RNN hidden, in pointer network
                 "W_ha":tf.get_variable("W_ha", shape=(2*h, h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
+                # for question param, in pointer network init state
                 "W_vQ":tf.get_variable("W_vQ", shape=(h, h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
+                # question param, in pointer network init state
                 "V_rQ":tf.get_variable("V_rQ", shape=(question_len, h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer()),
+                # attention vector, in GABR, self-attention, pointer network init state, pointer network
                 "v":tf.get_variable("v", shape=(h), dtype=tf.float32,
                     initializer=tf.contrib.layers.xavier_initializer())}
 
@@ -121,10 +151,30 @@ class Attention(object):
     """
 
     def __init__(self, keep_prob, hidden_size):
+        """
+        Inputs:
+          hidden_size: int. Hidden size of the RNN
+          keep_prob: Tensor containing a single scalar that is the keep probability (for dropout)
+        """
         self.hidden_size = hidden_size
         self.keep_prob = keep_prob
 
     def build_graph(self, inputs, inputs_mask, memory, memory_mask, params, self_matching):
+        """
+        Inputs:
+          inputs: Tensor shape (batch_size, context_len, input_size)
+          inputs_masks: Tensor shape (batch_size, context_len).
+            Has 1s where there is real input, 0s where there's padding.
+            This is used to make sure tf.nn.bidirectional_dynamic_rnn doesn't iterate through masked steps.
+          memory: Tensor shape (batch_size, memory_len, input_size)
+          memory_mask: Tensor shape (batch_size, memory_len)
+          params: weight matrices and other network parameters
+          self_matching: boolean, False for GABR, True for self-attention
+
+        Returns:
+          outputs: Tensor shape (batch_size, context_len, hidden_size) for GABR.
+                   Tensor shape (batch_size, context_len, hidden_size*2) for self-attention.
+        """
         with vs.variable_scope("GatedAttn"):
             cell = Attended_Rnn(self.hidden_size, memory, memory_mask, params, self_matching)
             cell = DropoutWrapper(cell, input_keep_prob=self.keep_prob)
@@ -145,35 +195,46 @@ class Attention(object):
 
 
 class Attended_Rnn(RNNCell):
-  def __init__(self, hidden_size, memory, memory_mask, params, self_matching):
-    super(RNNCell, self).__init__()
-    self.cell = rnn_cell.GRUCell(hidden_size)
-    self.hidden_size = hidden_size
-    self.memory = memory
-    self.memory_mask = memory_mask
-    self.params = params
-    self.self_matching = self_matching
+    """
+    Since both GABR and self-attention have to attend the inputs at each time step of an RNN,
+    we created a wrapper around a cell to do so. Inspired by an open-source implementation of
+    r-net referenced above.
+    """
+    def __init__(self, hidden_size, memory, memory_mask, params, self_matching):
+        super(RNNCell, self).__init__()
+        self.cell = rnn_cell.GRUCell(hidden_size)
+        self.hidden_size = hidden_size
+        self.memory = memory
+        self.memory_mask = memory_mask
+        self.params = params
+        self.self_matching = self_matching
 
-  @property
-  def state_size(self):
-    return self.hidden_size
+    @property
+    def state_size(self):
+        return self.hidden_size
 
-  @property
-  def output_size(self):
-    return self.hidden_size
+    @property
+    def output_size(self):
+        return self.hidden_size
 
-  def __call__(self, inputs, state, scope = None):
-    """Gated recurrent unit (GRU) with nunits cells."""
-    inputs = attend_inputs(inputs, state, self.memory, self.memory_mask, self.hidden_size, self.params, self.self_matching)
-    output, new_state = self.cell(inputs, state, scope)
-    return output, new_state
+    def __call__(self, inputs, state, scope = None):
+        inputs = attend_inputs(inputs, state, self.memory, self.memory_mask, self.hidden_size, self.params, self.self_matching)
+        output, new_state = self.cell(inputs, state, scope)
+        return output, new_state
 
 
 def attend_inputs(inputs, state, memory, memory_mask, hidden_size, params, self_matching):
     """
-    inputs: shape (batch_size, 2*hidden_size) if gated, (batch_size, hidden_size) if self
-    state: shape (batch_size, hidden_size)
-    memory: shape (batch_size, question_len, 2*hidden_size)
+    Inputs:
+      inputs: Tensor shape (batch_size, context_len, input_size)
+      state: Tensor shape (batch_size, hidden_size)
+      memory: Tensor shape (batch_size, memory_len, input_size)
+      memory_mask: Tensor shape (batch_size, memory_len)
+      params: weight matrices and other network parameters
+      self_matching: boolean, False for GABR, True for self-attention
+
+    Returns:
+      outputs: Tensor shape (batch_size, context_len, input_size), the attended inputs
     """
     with tf.variable_scope("attend_inputs"):
         attn_params = params["attn_params"]
@@ -192,14 +253,14 @@ def attend_inputs(inputs, state, memory, memory_mask, hidden_size, params, self_
 
 def attention(attn_params, inputs, memory_mask, hidden_size):
     """
-    TODO: update
-    inputs: shape (batch_size, 2*hidden_size)
-    state: shape (batch_size, hidden_size)
-    memory: shape (batch_size, question_len, 2*hidden_size)
-    wuq 2hxh
-    wup hxh
-    wvp 2hxh
+    Inputs:
+      attn_params: map of list of weight matrices and v
+      inputs: Tensor shape (batch_size, context_len, input_size)
+      memory_mask: Tensor shape (batch_size, memory_len)
+      hidden_size: int. Hidden size of the RNN
 
+    Returns:
+      masked_logits and prob_dist, Tensors shape (batch_size, memory_len)
     """
     with tf.variable_scope("attention"):
         weights = attn_params["weights"]
@@ -226,6 +287,11 @@ class AnswerPointer(object):
     """
 
     def __init__(self, hidden_size, keep_prob):
+        """
+        Inputs:
+          hidden_size: int. Hidden size of the RNN
+          keep_prob: Tensor containing a single scalar that is the keep probability (for dropout)
+        """
         self.hidden_size = hidden_size
         self.keep_prob = keep_prob
 
@@ -234,11 +300,11 @@ class AnswerPointer(object):
         The output layer of r-net, an answer pointer network
 
         Inputs:
-            self_attn_output: 
-            params: 
-            question_hiddens: 
-            question_mask: 
-            context_mask: 
+            self_attn_output: Tensor shape (batch_size, context_len, 2*hidden_size)
+            params: map of list of weight matrices and v
+            question_hiddens: Tensor shape (batch_size, question_len, 2*hidden_size)
+            question_mask: Tensor shape (batch_size, question_len)
+            context_mask: Tensor shape (batch_size, context_len)
 
         Outputs:
           logits_start: raw logits before softmax

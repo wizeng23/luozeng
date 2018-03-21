@@ -108,7 +108,6 @@ class QAModel(object):
     def add_embedding_layer(self, emb_matrix):
         """
         Adds word embedding layer to the graph.
-        and add character embedding to the graph
 
         Inputs:
           emb_matrix: shape (400002, embedding_size).
